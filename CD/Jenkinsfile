@@ -175,7 +175,8 @@ pipeline {
 
     stage('Kafka: verify prediction message') {
       when {
-        expression { return params.RUN_SCENARIOS && params.RUN_KAFKA_VERIFY }
+        // Если job создан до появления параметра, params.RUN_KAFKA_VERIFY == null — тогда && давало бы «ложь» и стадия молча пропускалась.
+        expression { return params.RUN_SCENARIOS && (params.RUN_KAFKA_VERIFY != false) }
       }
       steps {
         sh '''
@@ -197,7 +198,8 @@ pipeline {
 
   post {
     always {
-      archiveArtifacts artifacts: 'artifacts/functional_report.json,artifacts/kafka_functional_report.json', allowEmptyArchive: true
+      sh 'ls -la artifacts 2>/dev/null || echo "artifacts/: (нет каталога)"'
+      archiveArtifacts artifacts: 'artifacts/*.json', allowEmptyArchive: true
       sh '''
         docker rm -f "${APP_CONTAINER}" "${DB_CONTAINER}" "${VAULT_CONTAINER}" "${KAFKA_CONTAINER}" 2>/dev/null || true
         docker network rm cd-net 2>/dev/null || true
