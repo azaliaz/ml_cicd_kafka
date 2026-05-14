@@ -181,16 +181,25 @@ pipeline {
       steps {
         sh '''
           mkdir -p artifacts
-          docker run --rm \
+          # Отчёт в /tmp внутри контейнера + docker cp: bind-mount workspace в verify-контейнере
+          # на Jenkins часто не даёт файла на хосте (в логе JSON есть, ls artifacts — только functional).
+          V_NAME="housing-kafka-verify-${BUILD_NUMBER:-0}-$$"
+          docker rm -f "${V_NAME}" 2>/dev/null || true
+          docker run --name "${V_NAME}" \
             --network cd-net \
-            -v "$(pwd)/artifacts:/out" \
             --entrypoint python \
             -e VAULT_ADDR="http://${VAULT_CONTAINER}:8200" \
             -e VAULT_TOKEN="${VAULT_DEV_TOKEN}" \
             -e VAULT_KAFKA_SECRET_PATH="secret/data/housing/kafka" \
             -w /app \
             "${DOCKER_IMAGE}" \
-            scripts/verify_kafka_prediction.py --timeout 90 --report-json /out/kafka_functional_report.json
+            scripts/verify_kafka_prediction.py --timeout 90 --report-json /tmp/kafka_functional_report.json
+          VERIFY_EC=$?
+          if [ "${VERIFY_EC}" -eq 0 ]; then
+            docker cp "${V_NAME}:/tmp/kafka_functional_report.json" artifacts/kafka_functional_report.json
+          fi
+          docker rm -f "${V_NAME}" 2>/dev/null || true
+          exit "${VERIFY_EC}"
         '''
       }
     }
