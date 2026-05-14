@@ -26,7 +26,7 @@ coverage.json
 .DS_Store
 
 *.log
-img/
+
 
 data/processed/
 data/.sklearn_cache/
