@@ -1,0 +1,218 @@
+pipeline {
+  agent any
+
+  parameters {
+    string(name: 'DOCKER_IMAGE', defaultValue: 'azaliaz/ml_cicd_kafka:latest', description: 'Образ из registry')
+    string(name: 'HOST_PORT', defaultValue: '18080', description: 'Порт на агенте для API')
+    string(name: 'DB_PORT', defaultValue: '55432', description: 'Порт PostgreSQL на агенте')
+    string(name: 'DB_NAME', defaultValue: 'housing', description: 'Имя БД PostgreSQL')
+    booleanParam(name: 'RUN_PYTEST_IN_CONTAINER', defaultValue: true, description: 'CD: pytest внутри контейнера')
+    booleanParam(name: 'RUN_SCENARIOS', defaultValue: true, description: 'CD: сценарии против поднятого API')
+    booleanParam(name: 'RUN_KAFKA_VERIFY', defaultValue: true, description: 'CD: проверка сообщения prediction в Kafka после сценариев')
+  }
+
+  triggers { cron('H 2 * * *') }
+
+  environment {
+    SCENARIO_BASE_URL = "http://127.0.0.1:${params.HOST_PORT}"
+    APP_CONTAINER = "housing-api-cd"
+    DB_CONTAINER = "housing-db-cd"
+    VAULT_CONTAINER = "housing-vault-cd"
+    KAFKA_CONTAINER = "housing-kafka-cd"
+    VAULT_DEV_TOKEN = "cd-vault-root"
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Resolve project dir') {
+      steps {
+        script {
+          env.GIT_SHORT = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+        }
+      }
+    }
+
+    stage('Pull image') {
+      steps {
+        sh 'docker pull "${DOCKER_IMAGE}"'
+      }
+    }
+
+    stage('Build Vault image (secrets store)') {
+      steps {
+        sh 'docker build -f Dockerfile.vault -t housing-vault:cd .'
+      }
+    }
+
+    stage('Pytest inside container (CD)') {
+      when {
+        expression { return params.RUN_PYTEST_IN_CONTAINER }
+      }
+      steps {
+        sh 'docker run --rm -e SHOW_LOG=false --entrypoint python -w /app "${DOCKER_IMAGE}" -m pytest -q tests'
+      }
+    }
+
+    stage('Run PostgreSQL + Kafka + Vault + API') {
+      when {
+        expression { return params.RUN_SCENARIOS }
+      }
+      steps {
+        withCredentials([
+          usernamePassword(credentialsId: 'postgres-app-user', usernameVariable: 'DB_USER_CRED', passwordVariable: 'DB_PASSWORD_CRED')
+        ]) {
+          sh '''
+            set -e
+            docker network create cd-net 2>/dev/null || true
+            docker rm -f "${APP_CONTAINER}" "${DB_CONTAINER}" "${VAULT_CONTAINER}" "${KAFKA_CONTAINER}" 2>/dev/null || true
+
+            docker run -d --name "${KAFKA_CONTAINER}" \
+              --hostname kafka \
+              --network cd-net \
+              docker.redpanda.com/redpandadata/redpanda:v24.2.12 \
+              redpanda start \
+              --smp 1 \
+              --memory 512M \
+              --reserve-memory 0M \
+              --overprovisioned \
+              --node-id 0 \
+              --kafka-addr PLAINTEXT://0.0.0.0:9092 \
+              --advertise-kafka-addr PLAINTEXT://kafka:9092
+
+            for i in $(seq 1 60); do
+              if docker exec "${KAFKA_CONTAINER}" rpk cluster health 2>/dev/null | grep -qi healthy; then
+                break
+              fi
+              sleep 2
+            done
+
+            docker run -d --name "${DB_CONTAINER}" \
+              --network cd-net \
+              -e POSTGRES_DB="${DB_NAME}" \
+              -e POSTGRES_USER="${DB_USER_CRED}" \
+              -e POSTGRES_PASSWORD="${DB_PASSWORD_CRED}" \
+              -p "${DB_PORT}:5432" \
+              postgres:16-alpine
+
+            for i in $(seq 1 60); do
+              if docker exec "${DB_CONTAINER}" pg_isready -U "${DB_USER_CRED}" -d "${DB_NAME}" >/dev/null 2>&1; then
+                break
+              fi
+              sleep 2
+            done
+
+            docker run -d --name "${VAULT_CONTAINER}" \
+              --network cd-net \
+              -e VAULT_DEV_ROOT_TOKEN_ID="${VAULT_DEV_TOKEN}" \
+              -e VAULT_SEED_DB_USER="${DB_USER_CRED}" \
+              -e VAULT_SEED_DB_PASSWORD="${DB_PASSWORD_CRED}" \
+              -e VAULT_SEED_DB_NAME="${DB_NAME}" \
+              -e VAULT_SEED_DB_HOST="${DB_CONTAINER}" \
+              -e VAULT_SEED_DB_PORT="5432" \
+              -e VAULT_SEED_KAFKA_BOOTSTRAP="kafka:9092" \
+              -e VAULT_SEED_KAFKA_TOPIC="housing.predictions" \
+              housing-vault:cd
+
+            for i in $(seq 1 60); do
+              if docker exec "${VAULT_CONTAINER}" sh -c "VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=\"${VAULT_DEV_TOKEN}\" vault kv get secret/housing/db" >/dev/null 2>&1 \
+                && docker exec "${VAULT_CONTAINER}" sh -c "VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=\"${VAULT_DEV_TOKEN}\" vault kv get secret/housing/kafka" >/dev/null 2>&1; then
+                break
+              fi
+              sleep 2
+            done
+
+            docker run -d --name "${APP_CONTAINER}" \
+              --network cd-net \
+              -p "${HOST_PORT}:8000" \
+              -e SKIP_PREPROCESS_TRAIN=1 \
+              -e VAULT_ADDR="http://${VAULT_CONTAINER}:8200" \
+              -e VAULT_TOKEN="${VAULT_DEV_TOKEN}" \
+              -e VAULT_SECRET_PATH="secret/data/housing/db" \
+              -e VAULT_KAFKA_SECRET_PATH="secret/data/housing/kafka" \
+              "${DOCKER_IMAGE}"
+          '''
+        }
+      }
+    }
+
+    stage('Wait for health') {
+      when {
+        expression { return params.RUN_SCENARIOS }
+      }
+      steps {
+        sh '''
+          # Внутри контейнера API всегда на :8000 (см. uvicorn в entrypoint). HOST_PORT — только проброс на хост.
+          for i in $(seq 1 120); do
+            if docker exec "${APP_CONTAINER}" curl -fsS "http://127.0.0.1:8000/health"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Healthcheck timeout (проверьте логи: docker logs ${APP_CONTAINER})"; exit 1
+        '''
+      }
+    }
+
+    stage('Functional scenarios (host → container)') {
+      when {
+        expression { return params.RUN_SCENARIOS }
+      }
+      steps {
+        sh '''
+          mkdir -p artifacts
+          docker exec "${APP_CONTAINER}" python scripts/run_scenarios.py \
+            --base-url "http://127.0.0.1:8000" \
+            --report-json /tmp/functional_report.json
+          docker cp "${APP_CONTAINER}:/tmp/functional_report.json" artifacts/functional_report.json
+        '''
+      }
+    }
+
+    stage('Kafka: verify prediction message') {
+      when {
+        // Если job создан до появления параметра, params.RUN_KAFKA_VERIFY == null — тогда && давало бы «ложь» и стадия молча пропускалась.
+        expression { return params.RUN_SCENARIOS && (params.RUN_KAFKA_VERIFY != false) }
+      }
+      steps {
+        sh '''
+          mkdir -p artifacts
+          # Отчёт в /tmp внутри контейнера + docker cp: bind-mount workspace в verify-контейнере
+          # на Jenkins часто не даёт файла на хосте (в логе JSON есть, ls artifacts — только functional).
+          V_NAME="housing-kafka-verify-${BUILD_NUMBER:-0}-$$"
+          docker rm -f "${V_NAME}" 2>/dev/null || true
+          docker run --name "${V_NAME}" \
+            --network cd-net \
+            --entrypoint python \
+            -e VAULT_ADDR="http://${VAULT_CONTAINER}:8200" \
+            -e VAULT_TOKEN="${VAULT_DEV_TOKEN}" \
+            -e VAULT_KAFKA_SECRET_PATH="secret/data/housing/kafka" \
+            -w /app \
+            "${DOCKER_IMAGE}" \
+            scripts/verify_kafka_prediction.py --timeout 90 --report-json /tmp/kafka_functional_report.json
+          VERIFY_EC=$?
+          if [ "${VERIFY_EC}" -eq 0 ]; then
+            docker cp "${V_NAME}:/tmp/kafka_functional_report.json" artifacts/kafka_functional_report.json
+          fi
+          docker rm -f "${V_NAME}" 2>/dev/null || true
+          exit "${VERIFY_EC}"
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      sh 'ls -la artifacts 2>/dev/null || echo "artifacts/: (нет каталога)"'
+      archiveArtifacts artifacts: 'artifacts/*.json', allowEmptyArchive: true
+      sh '''
+        docker rm -f "${APP_CONTAINER}" "${DB_CONTAINER}" "${VAULT_CONTAINER}" "${KAFKA_CONTAINER}" 2>/dev/null || true
+        docker network rm cd-net 2>/dev/null || true
+      '''
+    }
+  }
+}
